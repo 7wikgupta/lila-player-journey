@@ -217,9 +217,10 @@ the core progression moment = worst experiences. For a casual mobile game this i
 lila-player-journey/
 ├── public/
 │   ├── data/         <- the 4 JSON types (committed)
-│   └── minimaps/     <- 3 map images (copy from raw data's minimaps/)
+│   └── minimaps/     <- 3 map images (already copied in)
+├── raw_data/         <- February_* parquet day-folders (GIT-IGNORED, local only)
 ├── pipeline/
-│   └── build_data.py <- the offline pipeline; documented regenerate command
+│   └── build_data.py <- the offline pipeline; reads ./raw_data/, writes public/data/
 ├── src/              <- React app (canvas rendering, not SVG, for perf)
 └── README.md / ARCHITECTURE.md / INSIGHTS.md
 ```
@@ -228,8 +229,12 @@ lila-player-journey/
 - Render points/paths on **HTML canvas**, not SVG — thousands of position points will stutter in SVG.
 - Frontend just reads JSON + draws; no math beyond using pre-computed pixel coords.
 - Keep the raw parquet OUT of the repo (1,243 files). Only processed JSON + minimaps go in.
-- Path between raw data and project: raw parquet currently at
-  `C:\Users\user\Downloads\player_data\player_data\` — pipeline reads from there, writes into the project.
+- **Raw data location (Option A — chosen):** the `February_*` day-folders have been COPIED into
+  `raw_data/` inside the project, and `raw_data/` is git-ignored (never committed).
+  → The pipeline reads from the **relative path `./raw_data/`** (portable; works wherever the project lives).
+  → It globs `raw_data/February_*/*.nakama-0`. Do NOT use the old absolute
+     `C:\Users\user\Downloads\...` path — that was the pre-copy location and is no longer used.
+- Pipeline writes its JSON output into `public/data/` (committed). Minimaps already in `public/minimaps/`.
 
 ---
 
