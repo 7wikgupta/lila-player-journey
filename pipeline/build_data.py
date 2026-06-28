@@ -507,6 +507,165 @@ def verify_match_files(matches: dict, stats: dict):
             break
 
 
+# --------------------------------------------------------------------------- #
+# Piece D — heatmaps_{map_id}.json (precomputed 32x32 grids per map)
+# --------------------------------------------------------------------------- #
+#
+# Grid resolution = 32x32 (BUILD_BRIEF §4a): sized for the SPARSEST important
+# layer (deaths). Finer grids turned death signal into noise; 32x32 gives ~0.9
+# deaths/usable-cell on AmbroseValley so zones form. All four layers share it.
+#
+# Binning happens in the SAME 0..1024 pixel space the verified world_to_pixel
+# mapping produces, so every cell aligns to a real region of the map:
+#     cell_x = px // (coord_space / grid)
+#     cell_y = py // (coord_space / grid)
+# Grid is indexed [row=cell_y][col=cell_x]; the frontend recovers a cell's
+# pixel origin as cell * (coord_space / grid), then scales 1024 -> display size.
+# We emit grid + coord_space in every file so the frontend never has to guess.
+
+GRID = 32
+COORD_SPACE = MINIMAP_PX  # 1024 — same space as the pixel coords in match files
+
+# Layer -> the event set that feeds it. ALL-ACTOR by design (ATTRIBUTION mode
+# (2)): a heatmap describes a PLACE on the map, not a player, so NO is_bot
+# filter is applied to any layer (see ATTRIBUTION POLICY above).
+HEATMAP_LAYERS = {
+    "traffic": POSITION_EVENTS,        # Position + BotPosition
+    "deaths": DEATH_EVENTS,            # BotKilled + KilledByStorm
+    "kills": {KILL_EVENT},             # BotKill
+    "loot": {LOOT_EVENT},              # Loot
+}
+
+
+def _empty_grid():
+    return [[0] * GRID for _ in range(GRID)]
+
+
+def build_heatmaps(matches: dict) -> tuple[dict, dict]:
+    """Build one set of 32x32 grids per map. Returns (heatmaps, stats).
+
+    Heatmaps include EVERY match (bot-only ones too) and EVERY actor — this is
+    the 'describes a PLACE' case, matching how §4a's counts were derived.
+    """
+    cell = COORD_SPACE / GRID
+    heatmaps = {mp: {"grid": GRID, "coord_space": COORD_SPACE,
+                     **{layer: _empty_grid() for layer in HEATMAP_LAYERS}}
+                for mp in MAP_CONFIG}
+    oob = Counter()  # off-grid pixels per map (should be ~0 if mapping is sound)
+
+    for m in matches.values():
+        mp = m["map_id"]
+        hm = heatmaps[mp]
+        for r in m["rows"]:               # all actors — no is_bot filter, on purpose
+            for layer, events in HEATMAP_LAYERS.items():
+                if r.event in events:
+                    cx, cy = int(r.px // cell), int(r.py // cell)
+                    if 0 <= cx < GRID and 0 <= cy < GRID:
+                        hm[layer][cy][cx] += 1
+                    else:
+                        oob[mp] += 1
+                    break
+
+    stats = {"oob": dict(oob)}
+    return heatmaps, stats
+
+
+def _grid_total(grid):
+    return sum(sum(row) for row in grid)
+
+
+def _clustering(grid):
+    """Describe how concentrated a grid is: nonzero cells, max, and the share
+    of all events held by the top-5 cells. High top-5 share => real clustering."""
+    flat = sorted((v for row in grid for v in row), reverse=True)
+    total = sum(flat)
+    nonzero = sum(1 for v in flat if v)
+    top5 = sum(flat[:5])
+    top5_share = (top5 / total) if total else 0.0
+    return {"total": total, "nonzero": nonzero, "max": flat[0] if flat else 0,
+            "top5": top5, "top5_share": top5_share}
+
+
+def verify_heatmaps(heatmaps: dict, stats: dict):
+    print("\n=== heatmaps_{map_id}.json — Piece D verification ===")
+
+    print("  per-map, per-layer totals (all-actor) — reconcile vs event totals:")
+    for mp in ("AmbroseValley", "Lockdown", "GrandRift"):
+        hm = heatmaps[mp]
+        tot = {layer: _grid_total(hm[layer]) for layer in HEATMAP_LAYERS}
+        print(f"    {mp:14} traffic={tot['traffic']:6} deaths={tot['deaths']:4} "
+              f"kills={tot['kills']:5} loot={tot['loot']:5}")
+    print("    (§4a check: AmbroseValley deaths should be BotKilled 486 + Storm 17 = 503)")
+
+    print(f"\n  off-grid pixels (skipped, expect ~0): {stats['oob'] or 'NONE'}")
+
+    print("\n  CLUSTERING (AmbroseValley — expect a few hot cells, not flat scatter):")
+    for layer in ("deaths", "traffic"):
+        c = _clustering(heatmaps["AmbroseValley"][layer])
+        mean_nz = c["total"] / c["nonzero"] if c["nonzero"] else 0
+        print(f"    {layer:8} total={c['total']:6} nonzero_cells={c['nonzero']:4} "
+              f"max_cell={c['max']:5} mean_nonzero={mean_nz:5.1f} "
+              f"top5={c['top5']} ({c['top5_share']:.0%} of all events)")
+    print("    -> max_cell >> mean and a high top-5 share = clusters are real, not uniform.")
+
+    gr = _clustering(heatmaps["GrandRift"]["deaths"])
+    print(f"\n  LIMITATION: GrandRift deaths total={gr['total']} across "
+          f"{gr['nonzero']} cells — inherently sparse (§4a). Expected thin data, "
+          f"NOT a bug; document as a limitation (its death heatmap reads weak).")
+
+
+# --------------------------------------------------------------------------- #
+# Piece E — players.json (per-human index; enables a "player profile" lens)
+# --------------------------------------------------------------------------- #
+#
+# Per-player stats are HUMAN-only by definition (ATTRIBUTION mode (1)). Stats
+# are aggregated per user_id from THAT user's own rows, so the two-human match
+# splits its loot/kills/duration correctly between its two players.
+
+def build_players(matches: dict) -> list:
+    """Build players.json: per-human totals across the matches they appear in."""
+    # user_id -> match_id -> their rows in that match
+    per_user = defaultdict(lambda: defaultdict(list))
+    for m in matches.values():
+        for r in m["rows"]:
+            if not r.is_bot:
+                per_user[r.user_id][r.match_id].append(r)
+
+    players = []
+    for uid, by_match in per_user.items():
+        durations = [max(r.t for r in rows) for rows in by_match.values()]
+        total_loot = sum(1 for rows in by_match.values()
+                         for r in rows if r.event == LOOT_EVENT)
+        total_botkills = sum(1 for rows in by_match.values()
+                             for r in rows if r.event == KILL_EVENT)
+        players.append({
+            "user_id": uid,
+            "matches": len(by_match),
+            "total_loot": total_loot,
+            "total_botkills": total_botkills,
+            "avg_duration_s": round(sum(durations) / len(durations)),
+            "match_ids": sorted(by_match.keys()),
+        })
+
+    players.sort(key=lambda p: p["matches"], reverse=True)
+    return players
+
+
+def verify_players(players: list):
+    print("\n=== players.json — Piece E verification ===")
+    print(f"  players (unique humans): {len(players)}  (expect 245)")
+    memberships = sum(p["matches"] for p in players)
+    print(f"  total human-match memberships: {memberships}  "
+          f"(expect 781 = 779 solo + 1 two-human match counted for 2 players)")
+    print(f"  total loot across players: {sum(p['total_loot'] for p in players)}  "
+          f"(expect 12770 human Loot)")
+    print(f"  total botkills across players: {sum(p['total_botkills'] for p in players)}  "
+          f"(expect 2232 human BotKill)")
+    mc = Counter(p["matches"] for p in players)
+    print(f"  matches-per-player distribution: {dict(sorted(mc.items()))}")
+    print(f"  most active player: {json.dumps(players[0])}")
+
+
 if __name__ == "__main__":
     matches, files_read = ingest()
     verify(matches, files_read)
@@ -517,3 +676,12 @@ if __name__ == "__main__":
 
     stats = build_match_files(matches)
     verify_match_files(matches, stats)
+
+    heatmaps, hstats = build_heatmaps(matches)
+    for mp, hm in heatmaps.items():
+        write_json(f"heatmaps_{mp}.json", hm)
+    verify_heatmaps(heatmaps, hstats)
+
+    players = build_players(matches)
+    write_json("players.json", players)
+    verify_players(players)
