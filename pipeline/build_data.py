@@ -16,9 +16,11 @@ This file is being built in reviewable pieces. Piece A = ingestion + shared core
 """
 
 import glob
+import json
 import os
 from collections import Counter, defaultdict
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -146,7 +148,11 @@ def read_file(path: str) -> list:
     for i in range(n):
         r = Row()
         r.user_id = cols["user_id"][i]
-        r.match_id = cols["match_id"][i]
+        # The raw match_id column carries the '.nakama-0' storage-shard suffix
+        # (Nakama backend); the true match identifier is the UUID. Strip it so
+        # match_id is clean & URL-safe across matches.json / match_{id}.json /
+        # players.json.
+        r.match_id = cols["match_id"][i].removesuffix(".nakama-0")
         r.map_id = cols["map_id"][i]
         r.x = cols["x"][i]
         r.z = cols["z"][i]
@@ -269,6 +275,245 @@ def verify(matches, files_read):
     print(f"  Q3 position/id consistency mismatches: {dict(mismatches) or 'NONE'}")
 
 
+# --------------------------------------------------------------------------- #
+# Piece B — matches.json (the index; drives filtering + rankings)
+# --------------------------------------------------------------------------- #
+#
+# One entry per PLAYER-JOURNEY match. The 16 bot-only (zero-human) matches are
+# EXCLUDED by design: they have no player to follow, can't open in run-view, and
+# contribute nothing to scores/survival. They are kept as evidence for the
+# solo-PvE / low-population insight (documented in README), not as index rows.
+# Result: 780 matches (779 solo + 1 two-human). All per-match metrics use the
+# HUMAN-only attribution mode — see ATTRIBUTION POLICY above.
+
+# best_score weights (§4c) — a documented judgment call: engagement is
+# survival (duration) + progression (loot) + combat (botkills), minus a penalty
+# for dying before the first-loot "aha" moment.
+SCORE_W_DURATION = 0.4
+SCORE_W_LOOT = 0.3
+SCORE_W_BOTKILLS = 0.3
+SCORE_PRELOOT_PENALTY = 0.5
+
+
+def _match_metrics(m: dict) -> dict | None:
+    """Compute the human-centric metrics for one match. Returns None for
+    bot-only matches (excluded from the index by decision)."""
+    rows = m["rows"]
+    hrows = human_rows(rows)  # ATTRIBUTION mode (1): metrics are human-only
+    if not hrows:
+        return None  # bot-only match -> excluded
+
+    human_ids = {r.user_id for r in rows if not r.is_bot}
+    bot_ids = {r.user_id for r in rows if r.is_bot}
+
+    # duration_s = the human's own last event time (verified: human-only medians
+    # 357/403/427 reproduce §4d 356/403/427; all-rows overshoots).
+    duration_s = max(r.t for r in hrows)
+
+    loot = sum(1 for r in hrows if r.event == LOOT_EVENT)
+    botkills = sum(1 for r in hrows if r.event == KILL_EVENT)
+    died_bot = sum(1 for r in hrows if r.event == "BotKilled")
+    died_storm = sum(1 for r in hrows if r.event == "KilledByStorm")
+
+    # died_before_first_loot: the human's first death precedes their first loot
+    # (or they died having never looted). The aha-moment denial signal (§4d/§4e).
+    # We use a STRICT '<': a same-timestamp tie (death and loot at the same t)
+    # means the player DID loot, so it must NOT count as a pre-loot death. This
+    # is the definition that's correct on its own merits; it differs from the
+    # brief's §4d figures by <=1 match on the sparse maps (rounding noise), and
+    # we deliberately do not tune the operator to chase the brief's numbers.
+    first_loot = min((r.t for r in hrows if r.event == LOOT_EVENT), default=None)
+    first_death = min((r.t for r in hrows if r.event in DEATH_EVENTS), default=None)
+    died_before_first_loot = (
+        first_death is not None and (first_loot is None or first_death < first_loot)
+    )
+
+    return {
+        "match_id": next(iter({r.match_id for r in rows})),
+        "map_id": m["map_id"],
+        "date": m["date"],
+        "humans": len(human_ids),
+        "bots": len(bot_ids),
+        "duration_s": int(duration_s),
+        "loot": loot,
+        "botkills": botkills,
+        "died_storm": died_storm,
+        "died_bot": died_bot,
+        "died_before_first_loot": died_before_first_loot,
+        # best_score filled in by the second pass (needs global percentiles).
+    }
+
+
+def build_matches(matches: dict) -> list:
+    """Build matches.json: per-match human metrics + best_score (§3a, §4c)."""
+    # Pass 1: per-match metrics (drops bot-only matches).
+    entries = [e for e in (_match_metrics(m) for m in matches.values()) if e]
+
+    # Pass 2: normalize each score component by its GLOBAL 95th percentile
+    # (cap at 1) so outliers don't dominate the ranking (§4c).
+    def p95(key):
+        vals = np.array([e[key] for e in entries], dtype=float)
+        return float(np.percentile(vals, 95))
+
+    p95_dur, p95_loot, p95_bk = p95("duration_s"), p95("loot"), p95("botkills")
+
+    def norm(v, p):
+        return min(v / p, 1.0) if p > 0 else 0.0
+
+    for e in entries:
+        score = (
+            SCORE_W_DURATION * norm(e["duration_s"], p95_dur)
+            + SCORE_W_LOOT * norm(e["loot"], p95_loot)
+            + SCORE_W_BOTKILLS * norm(e["botkills"], p95_bk)
+        )
+        if e["died_before_first_loot"]:
+            score -= SCORE_PRELOOT_PENALTY
+        e["best_score"] = round(score, 2)
+
+    # Pre-rank the index by best_score (helps the ranking panel; filters don't
+    # care about order).
+    entries.sort(key=lambda e: e["best_score"], reverse=True)
+    return entries
+
+
+def write_json(name: str, obj):
+    os.makedirs(DATA_OUT, exist_ok=True)
+    path = os.path.join(DATA_OUT, name)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, separators=(",", ":"))
+    return path
+
+
+def verify_matches(entries: list):
+    """Piece B verification: cross-check the generated index against §4d/§4e."""
+    import statistics as st
+    print("\n=== matches.json — Piece B verification ===")
+    print(f"  entries (player-journey matches): {len(entries)}  "
+          f"(expect 780 = 779 solo + 1 two-human)")
+    hcount = Counter(e["humans"] for e in entries)
+    print(f"  humans-per-entry: {dict(sorted(hcount.items()))}")
+
+    maps = ("AmbroseValley", "GrandRift", "Lockdown")
+    print("\n  per-map medians vs §4d (dur 356/403/427, loot 15/13/12, botk 2/2/1):")
+    for mp in maps:
+        es = [e for e in entries if e["map_id"] == mp]
+        md = st.median([e["duration_s"] for e in es])
+        ml = st.median([e["loot"] for e in es])
+        mb = st.median([e["botkills"] for e in es])
+        print(f"    {mp:14} n={len(es):4} med_dur={md:.0f} med_loot={ml:.0f} med_botk={mb:.0f}")
+
+    print("\n  per-map rates vs §4d (bot/storm/preloot):")
+    print("    Ambrose 53%/3%/5% · GrandRift 42%/9%/7% · Lockdown 47%/10%/16%")
+    for mp in maps:
+        es = [e for e in entries if e["map_id"] == mp]
+        n = len(es)
+        b = sum(1 for e in es if e["died_bot"] > 0) / n
+        s = sum(1 for e in es if e["died_storm"] > 0) / n
+        pl = sum(1 for e in es if e["died_before_first_loot"]) / n
+        print(f"    {mp:14} bot={b:.0%} storm={s:.0%} preloot={pl:.0%}")
+
+    # Exit-mode overall (§4e: bot 403 / storm 39 / none 339).
+    bot = sum(1 for e in entries if e["died_bot"] > 0)
+    storm = sum(1 for e in entries if e["died_storm"] > 0 and e["died_bot"] == 0)
+    none = len(entries) - bot - storm
+    print(f"\n  exit-mode overall vs §4e (403/39/339): "
+          f"bot={bot} storm_only={storm} no_death={none}")
+
+    print("\n  best_score: "
+          f"max={max(e['best_score'] for e in entries):.2f} "
+          f"min={min(e['best_score'] for e in entries):.2f} "
+          f"penalized(<0)={sum(1 for e in entries if e['best_score'] < 0)}")
+    print("\n  top 3 by score:")
+    for e in entries[:3]:
+        print(f"    {e['best_score']:.2f} {e['map_id']:14} "
+              f"dur={e['duration_s']}s loot={e['loot']} botk={e['botkills']} "
+              f"{e['match_id'][:8]}")
+    print("\n  sample entry (JSON):")
+    print("   ", json.dumps(entries[0]))
+
+
+# --------------------------------------------------------------------------- #
+# Piece C — match_{match_id}.json (full event stream per run, lazy-loaded)
+# --------------------------------------------------------------------------- #
+#
+# One file per player-journey match (bot-only matches get no file). Each event
+# is time-normalized (t = t_rel seconds) and pre-mapped to minimap pixels, so
+# the frontend just draws. Includes BOTH human and bot rows — the bots are the
+# swarm the player fights, needed for run-view (§3b). Sorted by t.
+
+def _event_record(r) -> dict:
+    """One event in a match stream (§3b shape). Emits both pixel coords (for
+    trivial drawing) and raw world x/z (cheap insurance + coord-proof evidence)."""
+    return {
+        "t": int(r.t),
+        "event": r.event,
+        "px": r.px,
+        "py": r.py,
+        "x": round(r.x, 2),
+        "z": round(r.z, 2),
+        "is_bot": r.is_bot,
+    }
+
+
+def build_match_files(matches: dict) -> dict:
+    """Write match_{id}.json for every player-journey match. Returns stats."""
+    # Clear stale per-match files so a re-run can't leave orphans behind.
+    for old in glob.glob(os.path.join(DATA_OUT, "match_*.json")):
+        os.remove(old)
+
+    written, total_events = 0, 0
+    for m in matches.values():
+        if not any(not r.is_bot for r in m["rows"]):
+            continue  # bot-only match -> no run-view file (excluded by decision)
+        match_id = m["rows"][0].match_id
+        stream = [_event_record(r) for r in sorted(m["rows"], key=lambda r: r.t)]
+        write_json(f"match_{match_id}.json", stream)
+        written += 1
+        total_events += len(stream)
+    return {"files": written, "events": total_events}
+
+
+def verify_match_files(matches: dict, stats: dict):
+    print("\n=== match_{id}.json — Piece C verification ===")
+    print(f"  files written: {stats['files']}  (expect 780)")
+    print(f"  total events across files: {stats['events']}")
+
+    # Coord proof: the brief's verified example
+    # AmbroseValley world (-301.45, -355.55) -> pixel (78, 890).
+    px, py = world_to_pixel(-301.45, -355.55, MAP_CONFIG["AmbroseValley"])
+    print(f"  coord proof: world(-301.45,-355.55) -> pixel({px},{py})  "
+          f"[brief (78,890)] {'OK' if (px, py) == (78, 890) else 'DIFF'}")
+
+    # Inspect one real file: sort order, pixel bounds, human+bot presence.
+    sample_id = [m["rows"][0].match_id for m in matches.values()
+                 if any(not r.is_bot for r in m["rows"])][0]
+    stream = json.load(open(os.path.join(DATA_OUT, f"match_{sample_id}.json")))
+    ts = [e["t"] for e in stream]
+    pxs = [e["px"] for e in stream]
+    pys = [e["py"] for e in stream]
+    print(f"\n  sample file: match_{sample_id}.json")
+    print(f"    events={len(stream)}  t range {min(ts)}..{max(ts)}  "
+          f"sorted={ts == sorted(ts)}")
+    print(f"    px range {min(pxs)}..{max(pxs)}  py range {min(pys)}..{max(pys)} "
+          f"(0..1024 expected)")
+    print(f"    is_bot mix: {Counter(e['is_bot'] for e in stream)}")
+    print(f"    event mix: {dict(Counter(e['event'] for e in stream))}")
+    print(f"    first event: {json.dumps(stream[0])}")
+
+    # Sanity: a Loot/death event from some file, to eyeball coords land in-bounds.
+    for e in stream:
+        if e["event"] != "Position":
+            print(f"    a non-Position event: {json.dumps(e)}")
+            break
+
+
 if __name__ == "__main__":
     matches, files_read = ingest()
     verify(matches, files_read)
+
+    entries = build_matches(matches)
+    write_json("matches.json", entries)
+    verify_matches(entries)
+
+    stats = build_match_files(matches)
+    verify_match_files(matches, stats)
