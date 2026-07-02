@@ -57,6 +57,7 @@ header h1 { font-size: 20px; margin: 0; }
   color: #8b93a7;
   margin-bottom: 12px;
 }
+.panel .count { color: #6b728a; }
 .panel select {
   display: block;
   width: 100%;
@@ -91,28 +92,101 @@ header h1 { font-size: 20px; margin: 0; }
 }
 
 .stats {
+  margin: 0 0 16px;
+  padding: 12px;
+  background: #121622;
+  border: 1px solid #2a2f3e;
+  border-radius: 8px;
+}
+.stats-head {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #8b93a7;
+  margin-bottom: 8px;
+}
+.stats-head span { color: #39d0ff; }
+.stats ul {
   list-style: none;
   padding: 0;
-  margin: 0 0 16px;
+  margin: 0;
   line-height: 1.7;
 }
 .stats b { color: #fff; }
+.stats .outcome { margin-top: 4px; font-weight: 600; }
+.stats .outcome.bad { color: #ff6b6b; }
+.stats .outcome.storm { color: #c07bff; }
+.stats .outcome.good { color: #57d98a; }
+.stats-foot {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid #2a2f3e;
+  font-size: 11px;
+  color: #6b728a;
+  line-height: 1.45;
+}
 
-.legend {
+.layers-head {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid #2a2f3e;
+  font-size: 12px;
+  color: #8b93a7;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.layers {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  padding: 12px 0;
-  border-top: 1px solid #2a2f3e;
+  gap: 2px;
+  margin-top: 8px;
 }
-.item { display: flex; align-items: center; gap: 8px; }
-.swatch {
-  width: 12px;
-  height: 12px;
-  border-radius: 50%;
-  display: inline-block;
+.row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  color: #6b728a;
+  font-size: 13px;
+  cursor: pointer;
+  text-align: left;
+  opacity: 0.55;
+}
+.row:hover { background: #161a26; }
+.row.on { color: #e8ecf4; opacity: 1; }
+.row .glyph { opacity: 0.4; }
+.row.on .glyph { opacity: 1; }
+.row-label { flex: 1; }
+.row-count { color: #6b728a; font-variant-numeric: tabular-nums; }
+
+.switch {
   flex: none;
+  width: 26px;
+  height: 15px;
+  border-radius: 8px;
+  background: #2a2f3e;
+  position: relative;
+  transition: background 0.12s;
 }
+.switch::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: #6b728a;
+  transition: transform 0.12s, background 0.12s;
+}
+.row.on .switch { background: #35507e; }
+.row.on .switch::after { transform: translateX(11px); background: #cfe0ff; }
+
+.glyph { flex: none; display: block; }
 
 .note {
   margin-top: 12px;

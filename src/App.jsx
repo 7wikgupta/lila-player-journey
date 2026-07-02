@@ -1,11 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { MARKERS, HUMAN_COLOR, BOT_COLOR, drawMarker, drawTrail, drawBotDot } from './draw'
 import './App.css'
 
-// --- Gate 3: static minimap + coordinate proof -----------------------------
-// Load a minimap, plot ONE match's pre-mapped pixel coords on a canvas, and
-// visually confirm points land sensibly (loot near structures, not in voids).
-// The pipeline already emitted px/py in 1024-space; here we only scale 1024 ->
-// display size. No coordinate math beyond that, by design (BUILD_BRIEF §5).
+// --- Gate 4: run-view ("this player's story") ------------------------------
+// Filters (map · date · match) drive the view off matches.json; picking a match
+// lazy-loads its event stream and renders that ONE player's journey. The full
+// event stream (human + bot) is kept in state and rendered via layer selectors
+// — NOT stripped to human-only at load — so a future "the human's interacting
+// bots" layer (the bot that killed them, bots they killed) is just another
+// selector over data already present, no reload/rewrite needed.
+// Coordinates: pipeline emitted px/py in 1024-space; we only scale 1024 -> display.
 
 const MAPS = [
   { id: 'AmbroseValley', img: '/minimaps/AmbroseValley_Minimap.png' },
@@ -15,26 +19,22 @@ const MAPS = [
 const COORD_SPACE = 1024 // px space the pipeline binned/mapped into
 const DISPLAY = 760 // on-screen canvas size (square; maps are 1024x1024)
 
-// Event -> how it draws. Colors are distinct now; Gate 4 adds distinct shapes.
-const STYLE = {
-  Position: { color: '#39d0ff', r: 2 }, // human movement
-  BotPosition: { color: 'rgba(255,150,60,0.45)', r: 1.6 }, // bot swarm
-  Loot: { color: '#ffd23f', r: 4 }, // gold pickups
-  BotKill: { color: '#46e06f', r: 4.5 }, // human killed a bot
-  BotKilled: { color: '#ff4d4d', r: 6 }, // human died to a bot
-  KilledByStorm: { color: '#b06bff', r: 6 }, // human died to storm
-}
+// Toggleable layers (also the legend). Order = draw order top→bottom. Defaults:
+// human path + event types ON; bot positions OFF (noise in run-view).
+const LAYER_ROWS = [
+  { key: 'path', shape: 'line', color: HUMAN_COLOR, label: 'human trail', on: true },
+  { key: 'Loot', shape: 'diamond', color: MARKERS.Loot.color, label: 'loot', on: true },
+  { key: 'BotKill', shape: 'triangle', color: MARKERS.BotKill.color, label: 'botkill', on: true },
+  { key: 'BotKilled', shape: 'cross', color: MARKERS.BotKilled.color, label: 'death by bot', on: true },
+  { key: 'KilledByStorm', shape: 'star', color: MARKERS.KilledByStorm.color, label: 'storm death', on: true },
+  { key: 'bots', shape: 'ring', color: BOT_COLOR, label: 'bot positions', on: false },
+]
+const DEFAULT_LAYERS = Object.fromEntries(LAYER_ROWS.map((r) => [r.key, r.on]))
+const EVENT_KEYS = ['Loot', 'BotKill', 'BotKilled', 'KilledByStorm']
 
-// Pick a few visually rich demo matches for a map; adapt to sparse maps so
-// GrandRift (no swarm, few deaths) still yields good examples to eyeball.
-function pickDemos(all, mapId) {
-  const es = all.filter((m) => m.map_id === mapId)
-  const strict = es.filter((m) => m.bots >= 3 && m.loot >= 15 &&
-    m.botkills >= 2 && m.died_bot > 0)
-  const loose = es.filter((m) => m.loot >= 8 && m.botkills >= 1)
-  const pool = strict.length >= 3 ? strict : loose.length ? loose : es
-  return [...pool].sort((a, b) => b.best_score - a.best_score).slice(0, 6)
-}
+// Date helpers: matches.json carries "February_10".."February_14".
+const dayNum = (d) => parseInt(d.split('_')[1], 10)
+const dateLabel = (d) => d.replace('February_', 'Feb ')
 
 function App() {
   const canvasRef = useRef(null)
@@ -42,26 +42,48 @@ function App() {
   const [imgReady, setImgReady] = useState(false)
   const [allMatches, setAllMatches] = useState([])
   const [mapId, setMapId] = useState('AmbroseValley')
+  const [date, setDate] = useState('All')
   const [selected, setSelected] = useState(null)
   const [events, setEvents] = useState(null)
+  const [layers, setLayers] = useState(DEFAULT_LAYERS)
 
   const mapCfg = MAPS.find((m) => m.id === mapId)
+  const toggle = (key) => setLayers((l) => ({ ...l, [key]: !l[key] }))
 
   // Load the match index once.
   useEffect(() => {
     fetch('/data/matches.json').then((r) => r.json()).then(setAllMatches)
   }, [])
 
-  // Demo candidates for the current map.
-  const demos = useMemo(
-    () => (allMatches.length ? pickDemos(allMatches, mapId) : []),
-    [allMatches, mapId],
+  // Dates offered by the current map, in calendar order.
+  const dates = useMemo(() => {
+    const ds = [...new Set(
+      allMatches.filter((m) => m.map_id === mapId).map((m) => m.date),
+    )]
+    return ds.sort((a, b) => dayNum(a) - dayNum(b))
+  }, [allMatches, mapId])
+
+  // If the selected date isn't offered by the current map, fall back to All.
+  useEffect(() => {
+    if (date !== 'All' && !dates.includes(date)) setDate('All')
+  }, [dates]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Matches passing the map + date filter, best score first.
+  const filtered = useMemo(
+    () => allMatches
+      .filter((m) => m.map_id === mapId && (date === 'All' || m.date === date))
+      .sort((a, b) => b.best_score - a.best_score),
+    [allMatches, mapId, date],
   )
 
-  // When the map (and thus its demo list) changes, select its top match.
+  // Keep the selection valid: if the current match fell outside the new filter
+  // set, re-default to the highest-score match in it; never leave it empty.
   useEffect(() => {
-    if (demos.length) setSelected(demos[0].match_id)
-  }, [demos])
+    if (!filtered.length) { setSelected(null); return }
+    if (!filtered.some((m) => m.match_id === selected)) {
+      setSelected(filtered[0].match_id)
+    }
+  }, [filtered]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Load the current map's minimap image; clear stale events while it swaps.
   useEffect(() => {
@@ -72,7 +94,8 @@ function App() {
     img.src = mapCfg.img
   }, [mapCfg.img])
 
-  // Load the selected match's event stream.
+  // Load the selected match's FULL event stream (human + bot). Kept whole on
+  // purpose (see top-of-file note): layers select subsets at render time.
   useEffect(() => {
     if (!selected) return
     let alive = true
@@ -102,61 +125,56 @@ function App() {
     ctx.fillStyle = 'rgba(10,12,20,0.35)'
     ctx.fillRect(0, 0, DISPLAY, DISPLAY)
 
-    const dot = (e, st) => {
-      ctx.beginPath()
-      ctx.arc(X(e.px), Y(e.py), st.r, 0, Math.PI * 2)
-      ctx.fillStyle = st.color
-      ctx.fill()
-    }
-
-    // 1) bot positions (background swarm)
-    for (const e of events)
-      if (e.event === 'BotPosition') dot(e, STYLE.BotPosition)
-
-    // 2) the human journey path (Position points in time order)
-    const path = events.filter((e) => e.event === 'Position' && !e.is_bot)
-    ctx.strokeStyle = 'rgba(57,208,255,0.55)'
-    ctx.lineWidth = 1.5
-    ctx.beginPath()
-    path.forEach((e, i) => {
-      const x = X(e.px), y = Y(e.py)
-      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)
-    })
-    ctx.stroke()
-    for (const e of path) dot(e, STYLE.Position)
-
-    // 3) event markers on top (loot, kills, deaths)
-    const ordered = ['Loot', 'BotKill', 'BotKilled', 'KilledByStorm']
-    for (const type of ordered)
+    // 1) bot positions (off by default) — hollow orange rings, deliberately
+    //    unlike the human's solid trail.
+    if (layers.bots)
       for (const e of events)
-        if (e.event === type) {
-          const st = STYLE[type]
-          dot(e, st)
-          ctx.lineWidth = 1
-          ctx.strokeStyle = 'rgba(0,0,0,0.6)'
-          ctx.stroke()
-        }
+        if (e.event === 'BotPosition') drawBotDot(ctx, X(e.px), Y(e.py))
 
-    // mark the spawn (first human position)
-    if (path[0]) {
-      ctx.beginPath()
-      ctx.arc(X(path[0].px), Y(path[0].py), 5, 0, Math.PI * 2)
-      ctx.strokeStyle = '#ffffff'
-      ctx.lineWidth = 2
-      ctx.stroke()
+    // 2) the human journey as a continuous, time-ramped trail (a walk, not dots)
+    if (layers.path) {
+      const path = events
+        .filter((e) => e.event === 'Position' && !e.is_bot)
+        .map((e) => ({ x: X(e.px), y: Y(e.py) }))
+      drawTrail(ctx, path, HUMAN_COLOR)
     }
-  }, [imgReady, events])
 
-  const meta = demos.find((d) => d.match_id === selected)
-  const counts = events
-    ? events.reduce((a, e) => ((a[e.event] = (a[e.event] || 0) + 1), a), {})
-    : {}
+    // 3) THIS human's own events as distinct shapes, each independently
+    //    toggleable (run-view = one player's story; bot events -> map-view).
+    for (const type of EVENT_KEYS)
+      if (layers[type])
+        for (const e of events)
+          if (e.event === type && !e.is_bot)
+            drawMarker(ctx, X(e.px), Y(e.py), MARKERS[type])
+  }, [imgReady, events, layers])
+
+  const meta = filtered.find((d) => d.match_id === selected)
+  // Counts for the legend: human-only event tallies (run-view foregrounds THIS
+  // player), plus the bot-position total. These now match matches.json.
+  const hcount = {}
+  let botPos = 0
+  if (events)
+    for (const e of events) {
+      if (e.event === 'BotPosition') botPos++
+      else if (!e.is_bot) hcount[e.event] = (hcount[e.event] || 0) + 1
+    }
+
+  // This player's own outcome (human-only, from matches.json). No all-actor
+  // death counts here — those are a map-view concern. "no death recorded" is an
+  // inference (may be extraction, disconnect, or truncated telemetry; §4e).
+  const outcome = !meta
+    ? null
+    : meta.died_bot > 0
+      ? { text: 'died to a bot', cls: 'bad' }
+      : meta.died_storm > 0
+        ? { text: 'died to the storm', cls: 'storm' }
+        : { text: 'no death recorded (extracted / survived)', cls: 'good' }
 
   return (
     <div className="app">
       <header>
         <h1>LILA BLACK — Player Journey</h1>
-        <span className="gate">Gate 3 · coordinate proof</span>
+        <span className="gate">Gate 4 · run-view</span>
       </header>
 
       <div className="layout">
@@ -182,41 +200,66 @@ function App() {
           </label>
 
           <label>
-            Match
+            Date
+            <select value={date} onChange={(e) => setDate(e.target.value)}>
+              <option value="All">All dates</option>
+              {dates.map((d) => (
+                <option key={d} value={d}>{dateLabel(d)}</option>
+              ))}
+            </select>
+          </label>
+
+          <label>
+            Match <span className="count">({filtered.length})</span>
             <select
               value={selected ?? ''}
               onChange={(e) => setSelected(e.target.value)}
             >
-              {demos.map((d) => (
+              {filtered.map((d) => (
                 <option key={d.match_id} value={d.match_id}>
-                  {d.match_id.slice(0, 8)} · {d.duration_s}s · score {d.best_score}
+                  {d.match_id.slice(0, 8)} · {dateLabel(d.date)} · {d.duration_s}s · score {d.best_score}
                 </option>
               ))}
             </select>
           </label>
 
           {meta && (
-            <ul className="stats">
-              <li><b>{meta.duration_s}s</b> duration</li>
-              <li><b>{meta.loot}</b> loot · <b>{meta.botkills}</b> botkills</li>
-              <li><b>{meta.bots}</b> bots · died to bot: {meta.died_bot} · storm: {meta.died_storm}</li>
-            </ul>
+            <div className="stats">
+              <div className="stats-head">This run · <span>player</span></div>
+              <ul>
+                <li><b>{meta.duration_s}s</b> survived</li>
+                <li><b>{meta.loot}</b> loot picked up</li>
+                <li><b>{meta.botkills}</b> bots killed</li>
+                <li className={`outcome ${outcome.cls}`}>
+                  {outcome.text}
+                  {meta.died_before_first_loot && ' · before first loot'}
+                </li>
+              </ul>
+              <div className="stats-foot">
+                Aggregate / all-actor stats live in map-view (Gate 6).
+              </div>
+            </div>
           )}
 
-          <div className="legend">
-            <Item c={STYLE.Position.color} label="human path / position" />
-            <Item c="#ff9a3c" label={`bot position (${counts.BotPosition || 0})`} />
-            <Item c={STYLE.Loot.color} label={`loot (${counts.Loot || 0})`} />
-            <Item c={STYLE.BotKill.color} label={`botkill (${counts.BotKill || 0})`} />
-            <Item c={STYLE.BotKilled.color} label={`death by bot (${counts.BotKilled || 0})`} />
-            <Item c={STYLE.KilledByStorm.color} label={`death by storm (${counts.KilledByStorm || 0})`} />
-            <Item c="#ffffff" ring label="spawn (first position)" />
+          <div className="layers-head">Layers</div>
+          <div className="layers">
+            {LAYER_ROWS.map((row) => (
+              <Toggle
+                key={row.key}
+                shape={row.shape}
+                c={row.color}
+                label={row.label}
+                count={layerCount(row.key, hcount, botPos)}
+                on={layers[row.key]}
+                onClick={() => toggle(row.key)}
+              />
+            ))}
           </div>
 
           <p className="note">
-            Eyeball test: loot &amp; the path should hug structures/roads, not sit
-            in empty voids. Points are the pipeline's pre-mapped px/py scaled
-            {` ${COORD_SPACE}→${DISPLAY}`}.
+            Shapes carry meaning (colorblind-safe): ◆ loot · ▲ botkill · ✕ death
+            · ★ storm. The human is a continuous trail (dim→bright = start→end);
+            bots are hollow rings. Click a layer to toggle it.
           </p>
         </aside>
       </div>
@@ -224,17 +267,55 @@ function App() {
   )
 }
 
-function Item({ c, label, ring }) {
+// Count shown next to each layer row.
+function layerCount(key, hcount, botPos) {
+  if (key === 'bots') return botPos
+  if (key === 'path') return hcount.Position || 0
+  return hcount[key] || 0
+}
+
+// A layer row that doubles as legend + on/off switch. Its glyph is the actual
+// canvas glyph, so the shapes stay self-documenting.
+function Toggle({ shape, c, label, count, on, onClick }) {
   return (
-    <div className="item">
-      <span
-        className="swatch"
-        style={ring
-          ? { border: `2px solid ${c}`, background: 'transparent' }
-          : { background: c }}
-      />
-      {label}
-    </div>
+    <button type="button" className={on ? 'row on' : 'row'} onClick={onClick}>
+      <Glyph shape={shape} c={c} />
+      <span className="row-label">{label}</span>
+      <span className="row-count">{count}</span>
+      <span className="switch" aria-hidden="true" />
+    </button>
+  )
+}
+
+function Glyph({ shape, c }) {
+  const stroke = 'rgba(0,0,0,0.65)'
+  return (
+    <svg className="glyph" viewBox="0 0 16 16" width="16" height="16">
+      {shape === 'line' && (
+        <line x1="2" y1="8" x2="14" y2="8" stroke={c} strokeWidth="2.5" strokeLinecap="round" />
+      )}
+      {shape === 'ring' && (
+        <circle cx="8" cy="8" r="4" fill="none" stroke={c} strokeWidth="1.6" />
+      )}
+      {shape === 'diamond' && (
+        <polygon points="8,2 14,8 8,14 2,8" fill={c} stroke={stroke} strokeWidth="1" />
+      )}
+      {shape === 'triangle' && (
+        <polygon points="8,2 14,13 2,13" fill={c} stroke={stroke} strokeWidth="1" />
+      )}
+      {shape === 'cross' && (
+        <g stroke={c} strokeWidth="2.6" strokeLinecap="round">
+          <line x1="3" y1="3" x2="13" y2="13" />
+          <line x1="13" y1="3" x2="3" y2="13" />
+        </g>
+      )}
+      {shape === 'star' && (
+        <polygon
+          points="8,1 9.8,6 15,6 10.8,9.3 12.5,14.5 8,11.3 3.5,14.5 5.2,9.3 1,6 6.2,6"
+          fill={c} stroke={stroke} strokeWidth="0.8"
+        />
+      )}
+    </svg>
   )
 }
 
